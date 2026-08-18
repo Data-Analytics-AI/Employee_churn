@@ -1,0 +1,76 @@
+name: Build, Publish, and Deploy to AKS
+
+on:
+  workflow_run:
+    workflows: [Continuous Integration]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ACR_LOGIN_SERVER: aiperformanceregistry.azurecr.io
+  IMAGE_NAME: employee-churn
+  RESOURCE_GROUP: Churn_prediction
+  AKS_CLUSTER_NAME: AI-Performance-Module-Cluster
+  KUBERNETES_NAMESPACE: churn-prediction
+
+jobs:
+  publish:
+    name: Publish to ACR and deploy to AKS
+    # Deploy only a successful CI run originating from a push to main.
+    if: >-
+      github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Sign in to Azure with OpenID Connect
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to Azure Container Registry
+        run: az acr login --name AIPerformanceRegistry
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push immutable image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:sha-${{ github.event.workflow_run.head_sha || github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Publish latest tag for main
+        if: github.event_name == 'workflow_run'
+        run: |
+          docker buildx imagetools create \
+            --tag "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:latest" \
+            "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:sha-${{ github.event.workflow_run.head_sha }}"
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+      - name: Apply Kubernetes resources
+        run: kubectl apply -f k8s/namespace.yaml -f k8s/deployment.yaml -f k8s/service.yaml
+
+      - name: Deploy image and wait for rollout
+        run: |
+          kubectl --namespace "${KUBERNETES_NAMESPACE}" set image deployment/employee-churn-api \
+            employee-churn-api="${ACR_LOGIN_SERVER}/${IMAGE_NAME}:sha-${{ github.event.workflow_run.head_sha || github.sha }}"
+          kubectl --namespace "${KUBERNETES_NAMESPACE}" rollout status deployment/employee-churn-api --timeout=180s

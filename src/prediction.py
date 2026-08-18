@@ -1,8 +1,13 @@
 from datetime import datetime, date
+import json
+import logging
+import re
 from openai import AzureOpenAI
 from sqlalchemy import text
 from .config import AZURE_API_KEY, AZURE_ENDPOINT, AZURE_API_VERSION, AZURE_MODEL
 from .db import get_engine
+
+logger = logging.getLogger(__name__)
 
 client = AzureOpenAI(
     api_key     = AZURE_API_KEY,
@@ -35,17 +40,19 @@ def few_shot_prediction(employee_data):
     # Few-shot examples for churn prediction
     few_shot_prompt = """
     Observe the employee data provided and identify relationships between variables like a machine learning algorithm. 
-    Predict the likelihood of churn for the employee as a percentage titled "Likelihood of Churn:" (between 0% and 100%)
-    
-    Additionally, provide:
-    - A categorization (titled "Category:") categorized as:
-        - "Not likely to churn" (if prediction is less than 25%),
-        - "Less likely to churn" (if prediction is 25%-50%),
-        - "Likely to churn" (if prediction is 50%-75%),
-        - "Very likely to churn" (if prediction is above 75%).
-    - A brief summary (titled "Summary:") explaining the prediction.
-    - An analysis of key features (titled "Key Features Analysis:") in the format:
-      "feature: positive relationship (or negative relationship): reason".
+    Predict the likelihood of churn for the employee as a percentage between 0 and 100.
+
+    Return only a valid JSON object, with no Markdown or text outside the object:
+    {{
+      "likelihood": <number from 0 to 100>,
+      "ai_confidence": <integer from 1 to 100>,
+      "summary": "<brief explanation>",
+      "feature_analysis": "<key factors and their relationship to churn>"
+    }}
+
+    AI confidence measures confidence in the prediction, not likelihood of churn.
+    Reduce it substantially when fields are marked "Not provided" or listed as missing,
+    especially for performance, potential, salary, tenure, or work-pattern data.
       
     Employee data: {employee_data}
     """.format(employee_data=employee_data)
@@ -58,65 +65,63 @@ def few_shot_prediction(employee_data):
 
     # Call to OpenAI Chat Completions API
     response = client.chat.completions.create(
-        model="gpt-4o",  # -new Ensure this matches your model deployment
+        model=AZURE_MODEL,
         messages=messages,
         max_tokens=700,
-        temperature=0.1
+        temperature=0.1,
+        response_format={"type": "json_object"},
     )
-    print(response)
 
     # Extract the content from the response
     content = response.choices[0].message.content.strip()
-    #print(content)
 
-    # Initialize default return values
-    prediction_percentage = 0
-    prediction_label = "Prediction not available"
-    summary = "Summary not found in response."
-    feature_analysis = "Feature analysis not found in response."
+    prediction_percentage = 0.0
+    ai_confidence = 1
+    summary = "The model did not provide a summary."
+    feature_analysis = "The model did not provide feature analysis."
 
-    # Parse the response to extract the churn prediction percentage, summary, and feature analysis
     try:
-        # Extract the prediction percentage
-        percentage_start = content.find("Likelihood of Churn:")
-        percentage_end = content.find("%", percentage_start)
-        if percentage_start != -1 and percentage_end != -1:
-            prediction_percentage = float(content[percentage_start + len("Likelihood of Churn:"):percentage_end].strip())
+        prediction = json.loads(content)
+        prediction_percentage = max(0.0, min(100.0, float(prediction["likelihood"])))
+        ai_confidence = max(1, min(100, int(round(float(prediction["ai_confidence"])))))
+        summary = str(prediction["summary"]).strip() or summary
+        feature_analysis = str(prediction["feature_analysis"]).strip() or feature_analysis
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        # Preserve useful results from older/plain-text deployments instead of
+        # replacing every response field with N/A when a single parse fails.
+        logger.warning("Prediction response was not valid JSON; using text fallback: %s", error)
+        likelihood_match = re.search(
+            r"Likelihood\s+of\s+Churn[^0-9]{0,20}(\d+(?:\.\d+)?)\s*%?",
+            content,
+            re.IGNORECASE,
+        )
+        confidence_match = re.search(r"AI\s+Confidence[^0-9]{0,20}(\d{1,3})", content, re.IGNORECASE)
+        summary_match = re.search(
+            r"Summary\s*:\s*(.*?)(?=Key\s+Features\s+Analysis\s*:|$)",
+            content,
+            re.IGNORECASE | re.DOTALL,
+        )
+        analysis_match = re.search(r"Key\s+Features\s+Analysis\s*:\s*(.*)", content, re.IGNORECASE | re.DOTALL)
 
-        # Determine the prediction label based on the prediction percentage
-        if prediction_percentage < 25:
-            prediction_label = "Not likely to churn"
-            color = "green"
-        elif 25 <= prediction_percentage <= 50:
-            prediction_label = "Less likely to churn"
-            color = "lightgreen"
-        elif 50 < prediction_percentage <= 75:
-            prediction_label = "Likely to churn"
-            color = "yellow"
-        else:
-            prediction_label = "Very likely to churn"
-            color = "red"
+        if likelihood_match:
+            prediction_percentage = max(0.0, min(100.0, float(likelihood_match.group(1))))
+        if confidence_match:
+            ai_confidence = max(1, min(100, int(confidence_match.group(1))))
+        if summary_match and summary_match.group(1).strip():
+            summary = summary_match.group(1).strip()
+        if analysis_match and analysis_match.group(1).strip():
+            feature_analysis = analysis_match.group(1).strip()
 
-        # Extract the summary
-        summary_start = content.find("Summary:")
-        analysis_start = content.find("Key Features Analysis:")
-        if summary_start != -1 and analysis_start != -1:
-            summary = content[summary_start + len("Summary:"):analysis_start].strip()
+    if prediction_percentage < 25:
+        prediction_label = "Not likely to churn"
+    elif prediction_percentage <= 50:
+        prediction_label = "Less likely to churn"
+    elif prediction_percentage <= 75:
+        prediction_label = "Likely to churn"
+    else:
+        prediction_label = "Very likely to churn"
 
-        # Extract the feature analysis
-        analysis_start = content.find("Key Features Analysis:")
-        if analysis_start != -1:
-            feature_analysis = content[analysis_start + len("Key Features Analysis:"):].strip()
-
-    except Exception as e:
-        # Handle any parsing errors
-        prediction_percentage = "N/A"#Prediction percentage parsing error"
-        prediction_label = "N/A"#Prediction label parsing error"
-        summary = "N/A"#Summary parsing error"
-        feature_analysis = "N/A"#Feature analysis parsing error"
-        color = "N/A"
-
-    return prediction_percentage, prediction_label, summary, feature_analysis, color
+    return prediction_percentage, prediction_label, summary, feature_analysis, ai_confidence
 
 def update_or_insert_prediction(employee_id: int, data: dict):
     engine = get_engine()

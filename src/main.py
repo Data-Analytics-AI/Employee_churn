@@ -17,11 +17,9 @@ async def predict_churn(employee_id: int):
     if df is None:
         raise HTTPException(status_code=404, detail="Employee not found")
     proc = process_dataframe(df)
-    if proc is None:
-        raise HTTPException(status_code=400, detail="Missing required data")
     trans = transform_dataframe(proc)
     details = trans["details"].iloc[0]
-    pct, label, summary, analysis, color = few_shot_prediction(details)
+    pct, label, summary, analysis, ai_confidence = few_shot_prediction(details)
 
     data = {
         "employee_id": employee_id,
@@ -29,17 +27,26 @@ async def predict_churn(employee_id: int):
         "prediction_label": label,
         "summary": summary,
         "feature_analysis": analysis,
-        "color": color,
+        "ai_confidence": ai_confidence,
+        #"color": color,
         "date": datetime.now(),
         "companyId": proc["Company_ID"].iloc[0],
         "createdAt": date.today(),
         "updatedAt": date.today(),
     }
-    update_or_insert_prediction(employee_id, data)
-    return {"employee_id": employee_id, "likelihood": pct, "category": label}
+    print(f"Storing prediction for employee {employee_id}: {data}")
+    #update_or_insert_prediction(employee_id, data)
+    return {
+        "employee_id": employee_id,
+        "likelihood": pct,
+        "category": label,
+        "summary": summary,
+        "feature_analysis": analysis,
+        "ai_confidence": ai_confidence,
+    }
 
 def run_app():
-    uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("src.main:app", host="0.0.0.0", port=8002, reload=True)
 
 if __name__ == "__main__":
     run_app()

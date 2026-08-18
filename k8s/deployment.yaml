@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: employee-churn-api
+  namespace: churn-prediction
+  labels:
+    app.kubernetes.io/name: employee-churn-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: employee-churn-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: employee-churn-api
+    spec:
+      containers:
+        - name: employee-churn-api
+          image: aiperformanceregistry.azurecr.io/employee-churn:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: employee-churn-secrets
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
